@@ -1,0 +1,279 @@
+---
+title: "New York State Stressors"
+subtitle: "EOH710 Individual Project - Winter 2023"
+author: "Lisa Frueh"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/OneDrive - Drexel University/Research/EPA STAR/Spatial_Stressors")
+library(tidycensus)
+library(tidyverse)
+library(haven)
+library(openxlsx)
+library(tableone)
+library(readxl)
+
+
+census_api_key("304b0be4b7577202249c6612b2e926211c889fe8")
+```
+
+# ACS Variables
+
+Use tidycensus to gather 2011-2015 5-year ACS estimates for:
+
+*   Tract-level % people of color
+*   Tract-level income to poverty ratio
+*   Tract-level % people without health insurance coverage
+
+```{r variable dictionary}
+
+variables_dict <-
+  tibble::tribble(
+    ~var, ~shortname, ~desc,
+"B01003_001", 'total_pop', 'Total population',
+"B03002_001", 'race_total', 'Total population for race/ethnicity estimates',
+"B03002_003", 'nh_white_n', 'Population non-Hispanic white alone',
+"B03002_004", 'nh_black_n', 'Population non-Hispanic Black alone',
+"B03002_012", 'hisp_n', 'Population Hispanic or Latino, any race',
+"B23025_001", 'unemp_total', 'Total population for unemployment estimates',
+"B23025_007", 'unemp_n', 'Population in labor force, not employed',
+"C17002_001", 'fipr_total', 'Total population for family income to poverty ratio estimates',
+"C17002_002", 'fipr_under50_n', 'Population with family income to poverty ratio, past 12 months, < 0.50',
+"C17002_003", 'fipr_50_99_n', 'Population with family income to poverty ratio, past 12 months, 0.50 to 0.99',
+"C17002_004", 'fipr_100_124_n', 'Population with family  income to poverty ratio, past 12 months, 1.00 to 1.24',
+"C17002_005", 'fipr_125_149_n', 'Population with family income to poverty ratio, past 12 months, 1.25 to 1.49',
+"C17002_006", 'fipr_150_184_n', 'Population with family  income to poverty ratio, past 12 months, 1.50 to 1.84',
+"C17002_007", 'fipr_185_199_n', 'Population with family  income to poverty ratio, past 12 months, 1.85 to 1.99',
+"C17002_008", 'fipr_200_n', 'Population with family  income to poverty ratio, past 12 months, 2.00 and over',
+"B27010_001", 'unins_total', 'Total population for health insurance estimates',
+"B27010_002", 'unins_un18_total', 'Total population under 18 for health insurance estimates',
+"B27010_017", 'unins_un18_n', 'Population under 18 with no health insurance coverage',
+"B27010_018", 'unins_18_34_total', 'Total population aged 18-34 for health insurance estimates',
+"B27010_033", 'unins_18_34_n', 'Population aged 18-34 with no health insurance coverage',
+"B27010_034", 'unins_35_64_total', 'Total population aged 35-64 for health insurance estimates',
+"B27010_050", 'unins_35_64_n', 'Population aged 35-64 with no health insurance coverage',
+"B27010_051", 'unins_65_total', 'Total population aged 65 and older for health insurance estimates',
+"B27010_066", 'unins_65_n', 'Population aged 65 and older with no health insurance coverage'
+)
+```
+
+```{r get ACS variables}
+#get ACS using the variables we specified in our variable dictionary
+ACS2015 <- get_acs(
+  geography = 'tract',
+  state = 'NY',
+  geometry = FALSE,
+  year = 2015,
+  variables = variables_dict$var
+)
+
+#pivot wider to get one line per census tract
+ACS2015 <- ACS2015 %>%
+  select(-moe) %>%
+  pivot_wider(names_from = variable, values_from = estimate)
+
+#rename columns using the variable dictionary
+#create a named vector with information from the variable dictionary
+rename_vars <- setNames(variables_dict$var, variables_dict$shortname)
+# then we use rename_vars with the rename function from dplyr. 
+# typically the rename function takes a syntax as follows: 
+#   data %>% rename(newname1 = oldname1, newname2 = oldname2, ...)
+# but in our case, we already have a named vector (rename_vars) that we 
+# want to use, and so to use the rename_vars named vector inside rename
+# we use the injection-operator `!!`.  you can learn more about the injection
+# operator by running ?`!!` in your R console. 
+ACS2015 <- ACS2015 %>%
+  rename(!!rename_vars)
+
+#Check that the variables renamed
+names(ACS2015)
+```
+
+```{r calculate percents}
+ACS2015 <- ACS2015 %>%
+  mutate(
+    nh_white = 100*nh_white_n/race_total,
+    nh_black = 100*nh_black_n/race_total,
+    hisp = 100*hisp_n/race_total,
+    poc = 100*(race_total - nh_white_n)/race_total,
+    unemp = 100*unemp_n/unemp_total,
+    fipr_50 = 100*fipr_under50_n/fipr_total,
+    fipr_100 = 100*(fipr_under50_n + fipr_50_99_n)/fipr_total,
+    fipr_150 = 100*(fipr_under50_n + fipr_50_99_n + fipr_100_124_n + fipr_125_149_n)/fipr_total,
+    unins = 100*(unins_un18_n + unins_18_34_n + unins_35_64_n + unins_65_n)/unins_total,
+    unins_18 = 100*(unins_un18_n)/unins_un18_total,
+    unins_18_64 = 100*(unins_18_34_n + unins_35_64_n)/(unins_18_34_total + unins_35_64_total),
+    unins_65 = 100*unins_65_n/unins_65_total
+  ) %>%
+  select(-ends_with(c('n','total'))) %>%
+  dplyr::rename(GEOID10 = GEOID)
+
+```
+
+# NaNDA Variables
+
+Bring in compiled datasets from National Neighborhood Data Archive (NaNDA):
+
+*   Tract-level parks, 2018
+    +   Count of parks per census tract
+    +   Source: ParkServe
+    +   Melendez, Robert, Li, Mao, Khan, Anam, Gomez-Lopez, Iris, Clarke, Philippa, and Chenoweth, Megan. National Neighborhood Data Archive (NaNDA): Parks by Census Tract and ZIP Code Tabulation Area, United States, 2018. [distributor], 2022-12-15. https://doi.org/10.3886/ICPSR38586.v1
+*   Tract-level religious, civil, and social organizations, 2003-2017
+    +   Count and per capita density of select types of religious, civic, and social organizations –         such as churches, mosques, synagogues, ethnic associations, and veterans’ associations 
+    +   Source: NAICS and NETS
+    +    Finlay, Jessica, Li, Mao, Esposito, Michael, Gomez-Lopez, Iris, Khan, Anam, Clarke, Philippa, and Chenoweth, Megan. National Neighborhood Data Archive (NaNDA):  Religious, Civic, and Social Organizations by Census Tract, United States, 2003-2017. Ann Arbor, MI: Inter-university Consortium for Political and Social Research [distributor], 2020-10-20. https://doi.org/10.3886/E115967V2
+*   Tract-level medical services
+    +    Count and density of health care services in each census tract in the United States. The data includes counts, per capita densities, and area densities per tract for many types of businesses in the health care sector, including doctors, dentists, mental health providers, nursing homes, and pharmacies. 
+    +   Source: NAICS and NETS
+    +   Khan, Anam, Li, Mao, Finlay, Jessica, Esposito, Michael, Gomez-Lopez, Iris, Clarke, Philippa, and Chenoweth, Megan. National Neighborhood Data Archive (NaNDA): Health Care Services by Census Tract, United States, 2003-2017. Ann Arbor, MI: Inter-university Consortium for Political and Social Research [distributor], 2022-10-12. https://doi.org/10.3886/E120907V3
+
+
+```{r NaNDA}
+load(file = "./Data/Parks.rda")
+parks <- da38586.0001 %>%
+  mutate(GEOID10 = as.character(TRACT_FIPS10)) %>%
+  relocate(GEOID10) %>%
+  select(-TRACT_FIPS10) %>%
+  filter(str_detect(GEOID10, "^36")) %>%
+  mutate(
+    prop_park = PROP_PARK_AREA_TRACT,
+    park_area = TOT_PARK_AREA_SQMILES
+  ) %>%
+  select(GEOID10, prop_park, park_area)
+  
+#keep only relevant variables
+#We'll also take the average # of orgs over the 2003-2017 time period
+#And average the population
+relciv <- read_sas("./Data/RelCivOrgs.sas7bdat") %>%
+  select(tract_fips10, population, aland10, count_8134, count_8131) %>%
+  rename(GEOID10 = tract_fips10, 
+         land_area = aland10, 
+         rel_orgs_n =  count_8134, 
+         civ_orgs_n = count_8131) %>%
+  mutate(
+    rel_civ_orgs_n = rel_orgs_n + civ_orgs_n,
+    relciv_sqml = rel_civ_orgs_n/land_area,
+    relciv_perk = 1000*rel_civ_orgs_n/population
+  ) %>%
+  filter(str_detect(GEOID10, "^36")) %>%
+  group_by(GEOID10) %>%
+  summarize(
+    rel_orgs_n = mean(rel_orgs_n),
+    civ_orgs_n = mean(civ_orgs_n), 
+    rel_civ_orgs_n = mean(rel_civ_orgs_n),
+    relciv_sqml = mean(relciv_sqml),
+    relciv_perk = mean(relciv_perk)
+  ) 
+
+#For medical facilities, we'll take the average # of ambulatory facilities over the 2003-2017 time period
+med_facs <- read_sas("./Data/med_facilities.sas7bdat") %>%
+    select(tract_fips10, count_621, year, population) %>%
+    rename(GEOID10 = tract_fips10,
+           amb_facs_n = count_621,
+           ) %>%
+  mutate(
+    ambfacs_k = 1000*amb_facs_n/population
+  ) %>%
+  filter(str_detect(GEOID10, "^36")) %>%
+  group_by(GEOID10) %>%
+  summarize(
+    amb_facs_n = mean(amb_facs_n),
+    ambfacs_k = mean(ambfacs_k)
+  )
+```
+
+# Other Data Sources
+*   Supermarket access, 2015
+    +   USDA Food Research Atlas
+    +   https://www.ers.usda.gov/data-products/food-access-research-atlas/download-the-data/
+*   Disconnected Youth, 2012 
+    +   The number of youth aged 16-19 years who are neither enrolled in school nor in the labor force (employed or unemployed) divided by the number of youth aged 16-19 years, times 100.
+    +   Child Opportunity Index
+    +   diversitydatakids.org. 2022. “Disconnected youth, ages 16-19 (percent)”, retrieved from https://data.diversitydatakids.org/dataset/14005_1_p-disconnected-youth--ages-16-19--percent-?_external=True on Feb 15 2023, calculated from American Community Survey Summary Files 
+*   Imprisonment rate in state prisons per 100,000 people, 2010
+    +   Prison Policy Initiative
+    +   https://www.prisonpolicy.org/origin/ny/tracts.html
+```{r other data sources}
+
+#Share of tract population that are:
+# la_1_10 = beyond 1 mile for urban areas or 10 miles for rural areas from supermarket
+# la_05_10 = beyond 1/2 mile for urban areas or 10 miles for rural areas from supermarket
+# la_1_20 = beyond 1 mile for urban areas or 20 miles for rural areas from supermarket
+supermarket <- read.csv("./Data/FoodAccessResearchAtlasData2015.csv") %>%
+  mutate(
+    GEOID10 = as.character(CensusTract),
+    la_1_10 = round(100*LAPOP1_10/POP2010,4),
+    la_05_10 = round(100*LAPOP05_10/POP2010, 4),
+    la_1_20 = round(100*LAPOP1_20/POP2010, 4)
+  ) %>%
+  select(GEOID10, Urban, la_1_10, la_05_10, la_1_20) %>%
+  filter(str_detect(GEOID10, "^36"))
+
+#% of youth aged 16-19 years who are neither enrolled in school nor in the labor force, 2008-2012
+disc_youth <- read.csv("./Data/disconnected_youth.csv") %>%
+  filter(year=="2008-2012") %>%
+  select(geoid, total_est) %>%
+  rename(
+    disc_youth = total_est
+  ) %>%
+  mutate(
+    GEOID10 =   str_sub(geoid, start = -11, end = -1) 
+  ) %>%
+  relocate(GEOID10) %>%
+    select(-geoid) %>%
+  filter(str_detect(GEOID10, "^36"))
+
+#Tract residents incarcerated in New York State Prisons per 100,000, 2010
+incarceration <- read_excel("./Data/incarceration.xls") %>%
+  select(-Name) %>%
+  mutate(
+    GEOID10 = as.character(GEOID10)
+  )  %>% 
+  mutate(
+    statepris_rate = 
+      as.numeric(case_when(
+        statepris_rate=="n/a" ~ "",
+        TRUE ~ statepris_rate)
+  ))
+
+```
+
+#Compile Final Dataset
+Left-join all the datasets together
+
+```{r compile}
+
+Stressor_sample <- left_join(
+  ACS2015, disc_youth, by="GEOID10") %>%
+    left_join(., incarceration, by="GEOID10") %>%
+      left_join(., med_facs, by="GEOID10") %>%
+        left_join(., parks, by="GEOID10") %>%
+          left_join(., relciv, by="GEOID10") %>%
+            left_join(., supermarket, by="GEOID10") %>%
+  #Make a park area in square miles per thousand people
+    mutate(
+      park_a_perk = 1000*park_area/total_pop
+    )
+
+#Prep for import to ArcGIS Pro:
+# Deal with some NAs
+# Make sure all numeric variables are actually numeric
+Stressor_sample <- Stressor_sample %>%
+  mutate_all(., ~replace_na(.,)) %>%
+  mutate_at(c(3:44),as.numeric)
+
+#Save as Excel
+write.xlsx(Stressor_sample, "./Data/stressor_sample.xlsx")
+
+#Check that we have an appropriate number of tracts
+length(Stressor_sample$GEOID)
+```
+
+
+
+

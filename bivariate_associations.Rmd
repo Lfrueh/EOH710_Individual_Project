@@ -1,0 +1,206 @@
+---
+title: "Bivariate Correlations and Descriptive Statistics"
+author: "Lisa Frueh"
+date: '2023-03-07'
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+subtitle: EOH710 Individual Project - Winter 2023
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sf)
+library(spdep)
+library(Hmisc)
+library(ggcorrplot)
+library(plyr)
+library(gtsummary)
+setwd("~/Library/CloudStorage/OneDrive-DrexelUniversity/Research/EPA STAR/Spatial_Stressors")
+```
+
+# Read in Data
+Shapefile was created in ArcGIS Pro by joining 2010 NY tracts with tract-level stressors (see Tract_Stressor_Sample.Rmd).
+Gal weights file was created in GeoDa.
+
+```{r}
+ny <- st_read("./Data/shapefiles_weights/tract_stressor_sample.shp")
+
+#Read in weights file from GeoDa as an nb object--this creates a list of neighbors. In this case, first-order queen contiguity was used to define neighbors.
+queen.nb <- read.gal("./Data/shapefiles_weights/tract_ny_queen.gal", region.id=NULL, override.id=TRUE)
+
+#Create spatial weights from neighbors list, style = "W" defines row-standardized weights-sums over all links to n.
+lw <- nb2listw(queen.nb, glist=NULL, style="W", zero.policy=TRUE)
+
+
+```
+
+# Define variables of interest
+```{r}
+vars <-  c("park_a_per","la_05_10","unemp","fipr_100","poc","relciv_per","disc_youth","statepris1", "unins_18_6", "ambfacs_k")
+
+var_lab <- list(park_a_per = "Park area per 1,000 people", la_05_10 = "Low supermarket access", unemp = "% Unemployed", fipr_100 = "% Under poverty line", poc = "% People of color", relciv_per = "Religious & civic organizations per 1,000 people", disc_youth = "% Disconnected youth", statepris1 = "# Incarcerated in state prisons, per 1,000 people", unins_18_6="% Uninsured (18-64)", ambfacs_k = "Ambulatory medical facilities per 1,000 people")
+```
+
+# Pearson rho correlation (non-spatial)
+```{r}
+#remove geometry
+ny_ns <- st_drop_geometry(ny)
+
+#calculate correlation matrix
+rho.mat <- round(cor(ny_ns[vars]),2)
+
+#store p values
+p.mat <- cor_pmat(ny_ns[vars])
+
+#Visualize
+pearson_plot <-
+ggcorrplot(rho.mat,
+           p.mat = p.mat,
+           hc.order=TRUE,
+           type = "lower",
+           outline.color="white",
+           lab=TRUE,
+           lab_size = 3,
+           insig = "pch",
+           pch.col = "gray",
+           ggtheme = ggplot2::theme_gray,
+           colors = c("#6D9EC1", "white", "#E46726"),
+           legend.title = "Pearson r",
+           tl.cex = 9
+) + 
+  scale_x_discrete(labels = c("Uninsured", "Disconnected youth", "Unemployed", "Poverty", "Low food access", "Incarceration", "Parks", "Religious & civic orgs", "Medical facilities")) + 
+  scale_y_discrete(labels = c("People of color", "Uninsured", "Disconnected youth", "Unemployed", "Poverty", "Low food access", "Incarceration", "Parks", "Religious & civic orgs")) 
+
+ggsave("pearson_plot.png", pearson_plot, device="png")
+pearson_plot
+
+```
+# Lee's L statistic
+See: Lee (2001). Developing a bivariate spatial association measure: An integration of Pearson's r and Moran's I. J Geograph Syst 3: 369-385
+
+In short, this method deduces a global (and local, but we'll just use global) statistic of bivariate correlation between two spatial variables. 
+```{r}
+
+#Check that the Global L statistic is symmetrical, like rho
+poc_fipr100 <- lee(ny$poc, ny$fipr_100, lw, length(ny$poc), zero.policy=TRUE, NAOK=TRUE)
+poc_fipr100$L
+
+#Monte-carlo simulation for bootstrapped p-value
+test<- lee.mc(ny$poc, ny$fipr_100, nsim=99, lw, zero.policy=TRUE, alternative="two.sided", na.action=na.omit)
+
+# It is symmetrical!
+fipr100_poc <- lee(ny$fipr_100, ny$poc, lw, length(ny$fipr_100), zero.policy=TRUE, NAOK = TRUE)
+fipr100_poc$L
+
+```
+
+## All bivariate pairs
+Write a function to run Lee's L-statistic for all combinations of variables specified in 'vars'.
+```{r}
+
+#Write a function that computes the L-statistic and p-value (via Monte Carlo simulation) for bivariate association for a pair of variables, x and y, and returns a dataframe.
+leepair <- function(d, x, y){
+  test <- lee.mc(d[[x]], d[[y]], nsim=99, lw, zero.policy=TRUE, alternative="two.sided", na.action=na.omit)
+  L <- test$statistic
+  p <- test$p.value
+  data.frame(var1=x, var2=y, L=L, p=p)
+}
+
+#Apply this function to all possible combinations of variables 1-11 in the list "vars"
+#Then, combine these into one dataframe
+
+df_total<-data.frame()
+for(x in 1:10){
+  for(y in 10:1){
+    model <- plyr::ddply(ny, .(), leepair, x=vars[x], y=vars[y])
+    df <- data.frame(model)
+    df_total <- rbind(df_total,df)
+  }
+}
+
+#Create a matrix to hold the L values and p values for bivariate combinations
+lee.mat <- df_total %>%
+  select(-.id, -p) %>%
+  spread(var2, L) %>%
+  data.frame(., row.names = .$var1) %>%
+  select(-var1) %>%
+  as.matrix(.)
+
+
+lee.p.mat <- df_total %>%
+  select(-.id, -L) %>%
+  spread(var2, p) %>%
+  data.frame(., row.names = .$var1) %>%
+  select(-var1) %>%
+  as.matrix(.)
+
+
+#Visualize
+L_plot <-
+ggcorrplot(lee.mat,
+           p.mat = lee.p.mat,
+           hc.order=TRUE,
+           type = "lower",
+           outline.color="white",
+           lab=TRUE,
+           lab_size = 3,
+           insig = "pch",
+           pch.col = "gray",
+           ggtheme = ggplot2::theme_gray,
+           colors = c("#6D9EC1", "white", "#E46726"),
+           legend.title = "Lee's L",
+           tl.cex = 9
+) + 
+  scale_x_discrete(labels = c("Incarceration", "Parks", "Medical facilities", "Religious & civic orgs", "Unemployed", "Disconnected youth", "Poverty", "People of color", "Uninsured")) + 
+  scale_y_discrete(labels = c("Low food access", "Incarceration", "Parks", "Medical facilities", "Religious & civic orgs", "Unemployed", "Disconnected youth", "Poverty", "People of color"))
+
+ggsave("L_plot.png", L_plot, device="png")
+L_plot
+```
+
+# Descriptive Statistics
+```{r}
+
+ny_ns %>%
+  select(all_of(vars)) %>%
+  tbl_summary(
+    label = var_lab,
+    type = all_continuous() ~ "continuous2", 
+    statistic = all_continuous() ~ c(
+      "{mean}",
+      "{median} ({p25}, {p75})",
+      "{min}, {max}"
+    ),
+    missing = "no"
+  ) %>%
+  bold_labels()
+
+
+ny_ns %>%
+  select(all_of(vars), Urban) %>%
+  mutate(urb = case_when(
+    Urban==1 ~ "Urban",
+    Urban==0 ~ "Rural",
+    TRUE~NA_character_
+  )) %>%
+  tbl_summary(
+    by = urb,
+    label = var_lab,
+    type = all_continuous() ~ "continuous2", 
+    statistic = all_continuous() ~ c(
+      "{mean}",
+      "{median} ({p25}, {p75})",
+      "{min}, {max}"
+    ),
+    missing = "no"
+  ) %>%
+  modify_header(label ~ "**Variable**") %>%
+  add_p(pvalue_fun = ~ style_pvalue(.x, digits = 2)) %>%
+  bold_labels()
+
+```
+
